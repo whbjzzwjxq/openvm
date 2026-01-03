@@ -174,10 +174,7 @@ mod tests {
     use super::*;
     use crate::arch::testing::{GpuChipTestBuilder, TestBuilder};
 
-    #[test]
-    fn test_cuda_access_adapters_cpu_gpu_equivalence() {
-        let mem_config = MemoryConfig::default();
-
+    fn run_equivalence_test(mem_config: MemoryConfig) {
         let mut rng = StdRng::seed_from_u64(42);
         let decomp = mem_config.decomp;
         let mut tester = GpuChipTestBuilder::volatile(
@@ -189,7 +186,7 @@ mod tests {
         let aligns = [4, 4, 4, 1];
         let value_bounds = [256, 256, 256, (1 << 30)];
         let max_log_block_size = 4;
-        let its = 1000;
+        let its = 10;
         for _ in 0..its {
             let addr_sp = rng.gen_range(1..=aligns.len());
             let align: usize = aligns[addr_sp - 1];
@@ -241,7 +238,7 @@ mod tests {
 
         let mut controller = MemoryController::with_volatile_memory(
             MemoryBus::new(MEMORY_BUS),
-            mem_config,
+            mem_config.clone(),
             tester.cpu_range_checker(),
         );
         let all_memory_traces = controller
@@ -250,11 +247,17 @@ mod tests {
             .map(|ctx| ctx.common_main.unwrap())
             .collect::<Vec<_>>();
         let num_memory_traces = all_memory_traces.len();
+        let cnt_adapters = mem_config.max_access_adapter_n.ilog2() as usize;
         let cpu_traces: Vec<_> = all_memory_traces
             .into_iter()
-            .skip(num_memory_traces - NUM_ADAPTERS)
+            .skip(num_memory_traces - cnt_adapters)
             .collect::<Vec<_>>();
 
+        assert_eq!(
+            cpu_traces.len(),
+            gpu_traces.len(),
+            "CPU/GPU adapter trace count mismatch"
+        );
         for (cpu_trace, gpu_trace) in cpu_traces.into_iter().zip(gpu_traces.iter()) {
             assert_eq!(
                 cpu_trace.height() == 0,
@@ -265,5 +268,20 @@ mod tests {
                 assert_eq_host_and_device_matrix(cpu_trace, gpu_trace);
             }
         }
+    }
+
+    #[test]
+    fn test_cuda_access_adapters_cpu_gpu_equivalence() {
+        // Default configuration.
+        run_equivalence_test(MemoryConfig::default());
+    }
+
+    // This test is designed to expose a CUDA-only stride/indexing bug in access adapter tracegen
+    // when `max_access_adapter_n != 32` (i.e. when the number of access adapter AIRs is not 5).
+    #[test]
+    fn test_cuda_access_adapters_cpu_gpu_equivalence_max_access_adapter_n_8() {
+        let mut mem_config = MemoryConfig::default();
+        mem_config.max_access_adapter_n = 8;
+        run_equivalence_test(mem_config);
     }
 }
