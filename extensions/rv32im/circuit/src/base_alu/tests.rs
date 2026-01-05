@@ -555,3 +555,43 @@ fn test_cuda_rand_alu_tracegen(opcode: BaseAluOpcode, num_ops: usize) {
         .simple_test()
         .unwrap();
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_cuda_base_alu_size_mismatch_poc() {
+    let mut rng = create_seeded_rng();
+    let mut tester = GpuChipTestBuilder::default().with_bitwise_op_lookup(default_bitwise_lookup_bus());
+    let mut harness = create_cuda_harness(&tester);
+
+    // 1. Write 63 normal records (N=63).
+    for _ in 0..63 {
+        set_and_execute(&mut tester, &mut harness.executor, &mut harness.dense_arena, &mut rng, BaseAluOpcode::ADD, None, Some(false), None);
+    }
+
+    // 2. Transfer to matrix arena.
+    // CPU seeker finishes here, fixing the CPU record count to 63.
+    // Trace Height for CPU will be next_power_of_two(63) = 64.
+    type Record<'a> = (&'a mut Rv32BaseAluAdapterRecord, &'a mut BaseAluCoreRecord<RV32_REGISTER_NUM_LIMBS>);
+    harness.dense_arena.get_record_seeker::<Record, _>().transfer_to_matrix_arena(
+        &mut harness.matrix_arena,
+        EmptyAdapterCoreLayout::<F, Rv32BaseAluAdapterExecutor<RV32_CELL_BITS>>::new(),
+    );
+
+    // 3. !! INJECT 64th "GHOST" RECORD !!
+    // Use exactly 52 bytes (the real RECORD_SIZE discovered from previous panic).
+    // This ensures (records.len() % 52 == 0) so the GPU context generation won't panic.
+    // GPU will see (3276 + 52) / 52 = 64 records.
+    // GPU Trace Height = next_power_of_two(64) = 64.
+    {
+        let dirty_space = harness.dense_arena.alloc_bytes(52);
+        for byte in dirty_space.iter_mut() {
+            *byte = 0xEE; // Fill with garbage to trigger non-zero trace values
+        }
+    }
+
+    // 4. Verify Mismatch.
+    // assertion `left == right` failed: Mismatch at row 63 column 0
+    // left: 1995370221 (0x76EEEEEE)
+    // right: 0
+    tester.build().load_gpu_harness(harness).finalize().simple_test();
+}

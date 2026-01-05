@@ -58,13 +58,14 @@ template <size_t NUM_CELLS> struct LoadSignExtendCore {
 
         if ((shift & 2) != 0) {
             COL_WRITE_VALUE(row, Cols, shift_most_sig_bit, 1);
-            // Shift the read data by 2 places to the left
+            // Bypass nvcc offsetof bug by calculating base offset of the array field directly
+            size_t array_base_offset = offsetof(Cols<uint8_t>, shifted_read_data);
 #pragma unroll
             for (size_t i = 0; i < NUM_CELLS - 2; i++) {
-                COL_WRITE_VALUE(row, Cols, shifted_read_data[i], record.read_data[i + 2]);
+                row.write(array_base_offset + i, record.read_data[i + 2]);
             }
-            COL_WRITE_VALUE(row, Cols, shifted_read_data[NUM_CELLS - 2], record.read_data[0]);
-            COL_WRITE_VALUE(row, Cols, shifted_read_data[NUM_CELLS - 1], record.read_data[1]);
+            row.write(array_base_offset + NUM_CELLS - 2, record.read_data[0]);
+            row.write(array_base_offset + NUM_CELLS - 1, record.read_data[1]);
         } else {
             COL_WRITE_VALUE(row, Cols, shift_most_sig_bit, 0);
             COL_WRITE_ARRAY(row, Cols, shifted_read_data, record.read_data);
