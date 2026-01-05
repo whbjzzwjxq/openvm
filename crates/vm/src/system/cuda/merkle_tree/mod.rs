@@ -611,4 +611,63 @@ mod tests {
         eprintln!("{:?}", cpu_merkle_tree.root());
         eprintln!("{:?}", gpu_merkle_tree.top_roots.to_host().unwrap()[0]);
     }
+
+    #[test]
+    fn test_cuda_merkle_tree_as_type_mismatch_poc() {
+        let mut rng = create_seeded_rng();
+        let mem_config = {
+            let mut addr_spaces = MemoryConfig::empty_address_space_configs(5);
+            let max_cells = 1 << 10;
+            addr_spaces[RV32_MEMORY_AS as usize] =
+                openvm_circuit::arch::AddressSpaceHostConfig::new(max_cells, 1, MemoryCellType::U32);
+            MemoryConfig::new(2, addr_spaces, max_cells.ilog2() as usize, 29, 17, 32)
+        };
+
+        let mut initial_memory = GuestMemory::new(AddressMap::from_mem_config(&mem_config));
+        // Fill RV32_MEMORY_AS with some U32 values
+        for i in 0..10 {
+            unsafe {
+                initial_memory.write::<u32, 1>(
+                    RV32_MEMORY_AS,
+                    i as u32,
+                    [0x01020304],
+                );
+            }
+        }
+
+        let gpu_hasher_chip = Arc::new(Poseidon2PeripheryChipGPU::new(
+            1 << 16, // max_buffer_size
+            1,       // sbox_regs
+        ));
+        let mut gpu_merkle_tree = MemoryMerkleTree::new(mem_config.clone(), gpu_hasher_chip);
+        for (i, mem) in initial_memory.memory.get_memory().iter().enumerate() {
+            let mem_slice = mem.as_slice();
+            gpu_merkle_tree.build_async(
+                &(if !mem_slice.is_empty() {
+                    mem_slice.to_device().unwrap()
+                } else {
+                    DeviceBuffer::new()
+                }),
+                i,
+            );
+        }
+        gpu_merkle_tree.finalize();
+
+        let cpu_hasher_chip =
+            Poseidon2PeripheryChip::new(vm_poseidon2_config(), POSEIDON2_DIRECT_BUS, 3);
+        let cpu_merkle_tree = MerkleTree::<F, DIGEST_WIDTH>::from_memory(
+            &initial_memory.memory,
+            &mem_config.memory_dimensions(),
+            &cpu_hasher_chip,
+        );
+
+        // This SHOULD fail because CUDA's merkle_tree_init<1> (for AS 2) 
+        // will read only the first byte of each U32 and treat it as a field element,
+        // while CPU side will correctly read all 4 bytes as a U32 and convert to field element.
+        assert_eq!(
+            cpu_merkle_tree.root(),
+            gpu_merkle_tree.top_roots.to_host().unwrap()[0],
+            "PoC: Merkle Root mismatch! CUDA hardcoded U8 for AS 1-3."
+        );
+    }
 }
