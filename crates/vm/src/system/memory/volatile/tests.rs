@@ -1,4 +1,4 @@
-use std::{collections::HashSet, iter, sync::Arc};
+use std::{borrow::BorrowMut, collections::HashSet, iter, sync::Arc};
 
 use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
 use openvm_stark_backend::{
@@ -6,7 +6,7 @@ use openvm_stark_backend::{
     p3_field::FieldAlgebra,
     p3_matrix::dense::RowMajorMatrix,
     prover::{cpu::CpuBackend, types::AirProvingContext},
-    AirRef, Chip,
+    AirRef, Chip, ChipUsageGetter,
 };
 use openvm_stark_sdk::{
     config::baby_bear_poseidon2::{BabyBearPoseidon2Config, BabyBearPoseidon2Engine},
@@ -145,4 +145,109 @@ fn boundary_air_test() {
         ],
     )
     .expect("Verification failed");
+}
+
+#[test]
+fn volatile_initial_data_soundness_poc() {
+    use crate::system::memory::volatile::VolatileBoundaryCols;
+
+    let mut _rng = create_seeded_rng();
+
+    const MEMORY_BUS: BusIndex = 1;
+    const RANGE_CHECKER_BUS: BusIndex = 3;
+    const LIMB_BITS: usize = 15;
+    const DECOMP: usize = 8;
+    let memory_bus = MemoryBus::new(MEMORY_BUS);
+
+    let range_bus = VariableRangeCheckerBus::new(RANGE_CHECKER_BUS, DECOMP);
+    let range_checker = Arc::new(VariableRangeCheckerChip::new(range_bus));
+    let mut boundary_chip =
+        VolatileBoundaryChip::new(memory_bus, 2, LIMB_BITS, range_checker.clone());
+
+    // A malicious prover wants to initialize address (1, 100) with value 0x12345678
+    let mal_addr_space = 1;
+    let mal_pointer = 100;
+    let mal_initial_value = Val::from_canonical_u32(0x12345678);
+
+    let mut final_memory = TimestampedEquipartition::new();
+    final_memory.push((
+        (mal_addr_space, mal_pointer),
+        TimestampedValues {
+            values: [mal_initial_value],
+            timestamp: 10,
+        },
+    ));
+
+    boundary_chip.finalize(final_memory.clone());
+
+    // Generate honest proving context
+    let mut boundary_ctx = boundary_chip.generate_proving_ctx(());
+
+    // MALICIOUS ACT: Modify the trace to inject non-zero initial data
+    let width = boundary_chip.trace_width();
+    let main_trace = boundary_ctx.common_main.as_ref().unwrap();
+    let mut rows = main_trace.values.clone();
+    {
+        let row_slice = &mut rows[0..width];
+        let row: &mut VolatileBoundaryCols<Val> = row_slice.borrow_mut();
+
+        // This is the bug: initial_data is NOT constrained to be zero.
+        row.initial_data = mal_initial_value;
+    }
+    boundary_ctx.common_main = Some(Arc::new(RowMajorMatrix::new(rows, width)));
+
+    // Mock the memory bus interactions to match the malicious initial value
+    let init_memory_dummy_air = DummyInteractionAir::new(4, false, MEMORY_BUS);
+    let init_memory_trace = Arc::new(RowMajorMatrix::new(
+        vec![
+            Val::ONE,
+            Val::from_canonical_u32(mal_addr_space),
+            Val::from_canonical_u32(mal_pointer),
+            mal_initial_value, // Matches the malicious non-zero initial value
+            Val::ZERO,
+        ]
+        .into_iter()
+        .chain(iter::repeat_n(
+            Val::ZERO,
+            5 * (boundary_ctx.main_trace_height() - 1),
+        ))
+        .collect(),
+        5,
+    ));
+
+    let final_memory_dummy_air = DummyInteractionAir::new(4, true, MEMORY_BUS);
+    let final_memory_trace = Arc::new(RowMajorMatrix::new(
+        vec![
+            Val::ONE,
+            Val::from_canonical_u32(mal_addr_space),
+            Val::from_canonical_u32(mal_pointer),
+            mal_initial_value,
+            Val::from_canonical_u32(10),
+        ]
+        .into_iter()
+        .chain(iter::repeat_n(
+            Val::ZERO,
+            5 * (boundary_ctx.main_trace_height() - 1),
+        ))
+        .collect(),
+        5,
+    ));
+
+    // This SHOULD FAIL if there were a zero-init constraint.
+    // It passes, proving the soundness bug.
+    BabyBearPoseidon2Engine::run_test_fast(
+        vec![
+            Arc::new(boundary_chip.air.clone()),
+            Arc::new(range_checker.air.clone()),
+            Arc::new(init_memory_dummy_air),
+            Arc::new(final_memory_dummy_air),
+        ],
+        vec![
+            boundary_ctx,
+            range_checker.generate_proving_ctx(()),
+            AirProvingContext::simple_no_pis(init_memory_trace),
+            AirProvingContext::simple_no_pis(final_memory_trace),
+        ],
+    )
+    .expect("PoC failed: Malicious non-zero initialization was caught!");
 }
