@@ -1,4 +1,4 @@
-use std::{collections::HashSet, iter, sync::Arc};
+use std::{borrow::BorrowMut, collections::HashSet, iter, sync::Arc};
 
 use openvm_circuit_primitives::var_range::{VariableRangeCheckerBus, VariableRangeCheckerChip};
 use openvm_stark_backend::{
@@ -6,7 +6,7 @@ use openvm_stark_backend::{
     p3_field::FieldAlgebra,
     p3_matrix::dense::RowMajorMatrix,
     prover::{cpu::CpuBackend, types::AirProvingContext},
-    AirRef, Chip,
+    AirRef, Chip, ChipUsageGetter,
 };
 use openvm_stark_sdk::{
     config::baby_bear_poseidon2::{BabyBearPoseidon2Config, BabyBearPoseidon2Engine},
@@ -145,4 +145,95 @@ fn boundary_air_test() {
         ],
     )
     .expect("Verification failed");
+}
+
+#[test]
+fn volatile_register_range_soundness_poc() {
+    use crate::system::memory::volatile::VolatileBoundaryCols;
+
+    let mut _rng = create_seeded_rng();
+
+    const MEMORY_BUS: BusIndex = 1;
+    const RANGE_CHECKER_BUS: BusIndex = 3;
+    const LIMB_BITS: usize = 15;
+    const DECOMP: usize = 8;
+    let memory_bus = MemoryBus::new(MEMORY_BUS);
+
+    let range_bus = VariableRangeCheckerBus::new(RANGE_CHECKER_BUS, DECOMP);
+    let range_checker = Arc::new(VariableRangeCheckerChip::new(range_bus));
+    let mut boundary_chip =
+        VolatileBoundaryChip::new(memory_bus, 2, LIMB_BITS, range_checker.clone());
+
+    // According to the whitepaper, AS 1 is Registers, which must be constrained to [0, 2^8)
+    let reg_addr_space = 1;
+    let reg_pointer = 0;
+    // Malicious value: 256 (Exceeds 8-bit range)
+    let mal_data = Val::from_canonical_u32(256);
+
+    let mut final_memory = TimestampedEquipartition::new();
+    final_memory.push((
+        (reg_addr_space, reg_pointer),
+        TimestampedValues {
+            values: [mal_data],
+            timestamp: 1,
+        },
+    ));
+
+    boundary_chip.finalize(final_memory.clone());
+    let boundary_ctx = boundary_chip.generate_proving_ctx(());
+
+    // Mock memory bus interaction: Initial state (t=0)
+    let init_memory_dummy_air = DummyInteractionAir::new(4, false, MEMORY_BUS);
+    let init_memory_trace = Arc::new(RowMajorMatrix::new(
+        vec![
+            Val::ONE,
+            Val::from_canonical_u32(reg_addr_space),
+            Val::from_canonical_u32(reg_pointer),
+            Val::ZERO, // Honest initial value is 0
+            Val::ZERO,
+        ]
+        .into_iter()
+        .chain(iter::repeat_n(
+            Val::ZERO,
+            5 * (boundary_ctx.main_trace_height() - 1),
+        ))
+        .collect(),
+        5,
+    ));
+
+    // Mock memory bus interaction: Final state (t=1)
+    let final_memory_dummy_air = DummyInteractionAir::new(4, true, MEMORY_BUS);
+    let final_memory_trace = Arc::new(RowMajorMatrix::new(
+        vec![
+            Val::ONE,
+            Val::from_canonical_u32(reg_addr_space),
+            Val::from_canonical_u32(reg_pointer),
+            mal_data, // Malicious value 256
+            Val::ONE,
+        ]
+        .into_iter()
+        .chain(iter::repeat_n(
+            Val::ZERO,
+            5 * (boundary_ctx.main_trace_height() - 1),
+        ))
+        .collect(),
+        5,
+    ));
+
+    // Running verification. Due to missing 8-bit range check on data, mal_data = 256 passes!
+    BabyBearPoseidon2Engine::run_test_fast(
+        vec![
+            Arc::new(boundary_chip.air.clone()),
+            Arc::new(range_checker.air.clone()),
+            Arc::new(init_memory_dummy_air),
+            Arc::new(final_memory_dummy_air),
+        ],
+        vec![
+            boundary_ctx,
+            range_checker.generate_proving_ctx(()),
+            AirProvingContext::simple_no_pis(init_memory_trace),
+            AirProvingContext::simple_no_pis(final_memory_trace),
+        ],
+    )
+    .expect("PoC failed: mal_data = 256 in AS 1 should have been rejected by 8-bit range check!");
 }
