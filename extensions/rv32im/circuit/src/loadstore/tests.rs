@@ -2,7 +2,7 @@ use std::{array, borrow::BorrowMut, sync::Arc};
 
 use openvm_circuit::{
     arch::{
-        testing::{memory::gen_pointer, TestBuilder, TestChipHarness, VmChipTestBuilder},
+        testing::{memory::gen_pointer, TestBuilder, TestChipHarness, TestSC, VmChipTestBuilder, VmChipTester},
         Arena, ExecutionBridge, MemoryConfig, PreflightExecutor,
     },
     system::memory::{
@@ -499,6 +499,51 @@ fn run_loadbu_sanity_test() {
     assert_eq!(write_data1, [74, 0, 0, 0]);
     assert_eq!(write_data2, [186, 0, 0, 0]);
     assert_eq!(write_data3, [29, 0, 0, 0]);
+}
+
+#[test]
+fn poc_store_opcode_can_set_is_valid_zero() {
+    let mut rng = create_seeded_rng();
+    let mut mem_config = MemoryConfig::default();
+    mem_config.addr_spaces[RV32_REGISTER_AS as usize].num_cells = 1 << 29;
+    mem_config.addr_spaces[PUBLIC_VALUES_AS as usize].num_cells = 1 << 29;
+    let mut builder = VmChipTestBuilder::volatile(mem_config);
+    let mut harness = create_harness(&mut builder);
+
+    set_and_execute(
+        &mut builder,
+        &mut harness.executor,
+        &mut harness.arena,
+        &mut rng,
+        STOREW,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let adapter_width = BaseAir::<F>::width(&harness.air.adapter);
+    let modify_trace = |trace: &mut DenseMatrix<BabyBear>| {
+        let mut trace_row = trace.row_slice(0).to_vec();
+        let (adapter_row, core_row) = trace_row.split_at_mut(adapter_width);
+        let adapter_cols: &mut Rv32LoadStoreAdapterCols<F> = adapter_row.borrow_mut();
+        let core_cols: &mut LoadStoreCoreCols<F, RV32_REGISTER_NUM_LIMBS> = core_row.borrow_mut();
+
+        core_cols.is_valid = F::ZERO;
+        adapter_cols.needs_write = F::ZERO;
+        adapter_cols.mem_as = F::ZERO;
+
+        *trace = RowMajorMatrix::new(trace_row, trace.width());
+    };
+
+    disable_debug_builder();
+    let tester = VmChipTester::<TestSC>::default()
+        .load_and_prank_trace(harness, modify_trace)
+        .finalize();
+
+    tester
+        .simple_test()
+        .expect("PoC failed: expected constraints to be satisfiable");
 }
 
 // ////////////////////////////////////////////////////////////////////////////////////
