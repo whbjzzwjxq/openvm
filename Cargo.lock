@@ -7018,6 +7018,7 @@ dependencies = [
  "openvm-rv32im-circuit",
  "openvm-rv32im-guest",
  "openvm-rv32im-transpiler",
+ "openvm-sdk",
  "openvm-stark-sdk",
  "openvm-toolchain-tests",
  "openvm-transpiler",

