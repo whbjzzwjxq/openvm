@@ -40,6 +40,8 @@ mod tests {
         get_programs_dir,
     };
     use openvm_transpiler::{transpiler::Transpiler, FromElf};
+    use rrs_lib::instruction_executor::InstructionExecutor;
+    use rrs_lib::memories::VecMemory;
     use strum::IntoEnumIterator;
     use test_case::test_case;
 
@@ -405,6 +407,8 @@ mod tests {
         use openvm_sdk::{config::AppConfig, prover::verify_app_proof, Sdk, StdIn};
         use openvm_stark_sdk::openvm_stark_backend::p3_field::FieldAlgebra;
 
+        use rrs_lib::HartState;
+
         // --- 1. Setup Environment via SDK ---
         // Use the standard RISC-V 32 configuration from the SDK
         let mut app_config = AppConfig::riscv32();
@@ -419,7 +423,37 @@ mod tests {
         let sdk = Sdk::new(app_config)?;
         let app_vk = sdk.app_pk().get_app_vk();
 
-        // --- 2. Construct Malicious Instruction Stream ---
+        // --- 2. Oracle execution by rrs-lib ---
+        // Instructions:
+        // - AUIPC x0, 0x12345
+        // - ADD a0, x0, 0
+        // - TERMINATE
+        let mut hart = HartState::new();
+        hart.pc = 0;
+        // - AUIPC x0, 0x12345
+        // 0001 0010 0011 0100 0101 | 00000 | 0010111 = 0x12345017
+        let inst0 = 0x12345017;
+        // - ADD a0, x0, 0
+        // 0000 0000 0000 0000 0000 | 0101 0011 0011 0011 = 0x00000533
+        let inst1 = 0x00000533;
+        let mut mem = VecMemory::new(vec![inst0, inst1]);
+
+        let mut executor = InstructionExecutor {
+            mem: &mut mem,
+            hart_state: &mut hart,
+        };
+
+        executor.step().expect("Oracle step 1 (AUIPC) failed");
+        executor.step().expect("Oracle step 2 (ADD) failed");
+
+        let oracle_a0 = hart.registers[10];
+
+        assert_eq!(
+            oracle_a0, 0,
+            "Oracle Error: rrs-lib should strictly enforce x0 == 0"
+        );
+
+        // --- 3. Construct Malicious Instruction Stream ---
         let instructions = vec![
             // Instruction 1: AUIPC x0, 0x12345
             Instruction::new(
@@ -462,8 +496,7 @@ mod tests {
         let a0_u32 = u32::from_le_bytes(a0_bytes);
 
         assert_eq!(
-            a0_u32,
-            0x2468a00,
+            a0_u32, 0x2468a00,
             "Soundness Failure: x0 was not corrupted!"
         );
         println!("POC SUCCESS: Realized x0 soundness bug with hijacked prover!");

@@ -24,6 +24,7 @@ strum.workspace = true
 
 [dev-dependencies]
 openvm-sdk = { path = "../../../crates/sdk", features = ["test-utils"] }
+rrs-lib = { workspace = true }
 
 [features]
 default = ["parallel"]

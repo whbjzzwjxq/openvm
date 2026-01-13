@@ -7022,6 +7022,7 @@ dependencies = [
  "openvm-stark-sdk",
  "openvm-toolchain-tests",
  "openvm-transpiler",
+ "rrs-lib",
  "serde",
  "strum 0.26.3",
  "test-case",
