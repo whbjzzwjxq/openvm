@@ -263,6 +263,7 @@ where
         // during trace generation
         let record: &LessThanCoreRecord<NUM_LIMBS, LIMB_BITS> =
             unsafe { get_record_from_slice(&mut core_row, ()) };
+        let local_opcode_before = record.local_opcode;
 
         let core_row: &mut LessThanCoreCols<F, NUM_LIMBS, LIMB_BITS> = core_row.borrow_mut();
 
@@ -326,6 +327,13 @@ where
         core_row.cmp_result = F::from_bool(cmp_result);
         core_row.c = record.c.map(F::from_canonical_u8);
         core_row.b = record.b.map(F::from_canonical_u8);
+        debug_assert_eq!(
+            record.local_opcode,
+            local_opcode_before,
+            "less_than fill_trace_row local opcode changed in place: before={}, after={}",
+            local_opcode_before,
+            record.local_opcode
+        );
     }
 }
 

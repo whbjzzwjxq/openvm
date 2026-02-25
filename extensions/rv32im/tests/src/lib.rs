@@ -398,6 +398,39 @@ mod tests {
         }
     }
 
+    fn build_exe_from_words(words: &[u32]) -> Result<VmExe<F>> {
+        let transpiler = Transpiler::<F>::default()
+            .with_extension(Rv32ITranspilerExtension)
+            .with_extension(Rv32MTranspilerExtension);
+        let transpiled = transpiler.transpile(words)?;
+
+        let mut instructions: Vec<Instruction<F>> = transpiled.into_iter().flatten().collect();
+        instructions.push(Instruction::from_usize(
+            SystemOpcode::TERMINATE.global_opcode(),
+            [0, 0, 0],
+        ));
+        Ok(VmExe::new(Program::from_instructions(&instructions)))
+    }
+
+    #[test]
+    fn replay_seed_exposes_fill_trace_row_alias_or_not() -> Result<()> {
+        // Regression context (detailed): in less_than::fill_trace_row, `record` is first
+        // decoded from a shared row slice, then the same backing slice is mutably
+        // reinterpreted as `core_row` and written. Because both views alias the same
+        // memory layout, later reads from `record` observe bytes already overwritten by
+        // `core_row` writes: the same record can start with valid local_opcode (SLT=0 or
+        // SLTU=1) and later become out-of-domain 225 in the same function invocation.
+        // This seed reliably exercises that path (includes sltiu and trailing sltu).
+        let words: [u32; 9] = [
+            0x00400313, 0x00300593, 0x00700613, 0x00c58733, 0x00a00393, 0xfff00693, 0xfff6a713,
+            0x00000393, 0x00774533,
+        ];
+        let exe = build_exe_from_words(&words)?;
+        // air_test path goes through preflight + fill_trace_row.
+        air_test(Rv32ImBuilder, test_rv32im_config(), exe);
+        Ok(())
+    }
+
     #[test]
     fn test_e2e_x0_tamper_substitution_poc() -> Result<()> {
         use openvm_instructions::{
